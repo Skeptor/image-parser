@@ -13,8 +13,10 @@ def clean_group_name(name: str) -> str:
 
 
 def clean_stage_name(name: str) -> str:
-    """Normalize stage names."""
+    """Normalize stage names. Preserve Spanish 'Escenario' prefix."""
     name = name.strip()
+    if name.lower().startswith("escenario"):
+        return name
     suffixes = ["stage", "stg", "area", "zone", "platform", "podium"]
     lower = name.lower()
     for suffix in suffixes:
@@ -33,7 +35,7 @@ def compute_confidence(schedule) -> float:
     - Number of stages found
     - Number of slots per stage
     - Whether end_time was found
-    - Whether festival name was detected
+    - Whether date was detected
     """
     if not schedule or not schedule.stages:
         return 0.0
@@ -61,7 +63,7 @@ def compute_confidence(schedule) -> float:
     start_ratio = slots_with_start / total_slots if total_slots > 0 else 0
     scores.append(start_ratio * 0.3)
 
-    if schedule.festival:
+    if schedule.date:
         scores.append(0.2)
     else:
         scores.append(0.05)

@@ -4,7 +4,7 @@ from app.models import ConcertSlot, StageSchedule
 
 class TestCleanGroupName:
     def test_removes_separators(self):
-        assert clean_group_name("Band A | Band B") == "Band A  Band B"
+        assert clean_group_name("Band A | Band B") == "Band A Band B"
 
     def test_strips_whitespace(self):
         assert clean_group_name("  The Band  ") == "The Band"

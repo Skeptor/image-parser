@@ -5,11 +5,11 @@ from pathlib import Path
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
 
 from app.models import ParseResponse
+from app.services.column_detector import crop_column, detect_columns, get_column_text_from_words
 from app.services.image_loader import ImageLoadError, load_from_upload, load_from_url
-from app.services.ocr import OCRError, run_ocr
+from app.services.ocr import OCRError, run_ocr, run_ocr_column
 from app.services.schedule_extractor import extract_schedule
-from app.services.table_parser import detect_tables
-from app.utils import clean_group_name, clean_stage_name, compute_confidence
+from app.utils import compute_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,45 @@ async def parse_concert_schedule(
         raise HTTPException(status_code=400, detail=f"Failed to load image: {e}")
 
     try:
-        raw_text = run_ocr(pil_image, lang=lang, psm=psm)
+        columns = detect_columns(pil_image)
+
+        if len(columns) > 1:
+            logger.info("Multi-column layout detected, using word boxes for %d columns", len(columns))
+
+            # Find header y position to skip header words in content
+            header_y_max = 0
+            for col in columns:
+                for w in col.words:
+                    if w["top"] < pil_image.height * 0.15:  # Words in top 15%
+                        header_y_max = max(header_y_max, w["top"] + w["height"])
+
+            column_data = []
+            column_texts = []
+            for col in columns:
+                # Reconstruct text from word boxes (skipping header region)
+                text = get_column_text_from_words(col, skip_header_y=header_y_max)
+                column_texts.append(text)
+                # Filter words to exclude header region
+                content_words = [w for w in col.words if w["top"] > header_y_max]
+                column_data.append({"text": text, "header": col.header, "words": content_words})
+                logger.info("Column %d (header=%s): %d words, text preview: %s",
+                           col.index, col.header, len(col.words), text[:80].replace("\n", " ") + "...")
+
+            raw_text = "\n---COLUMN BREAK---\n".join(column_texts)
+            schedule = extract_schedule(raw_text, column_data=column_data)
+        else:
+            raw_text = run_ocr(pil_image, lang=lang, psm=psm)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                output_path = Path(tmpdir)
+                from app.services.table_parser import detect_tables
+
+                table_data = detect_tables(pil_image, output_path)
+            schedule = extract_schedule(raw_text, table_data=table_data)
+
     except OCRError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        logger.exception("Parse pipeline failed")
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
 
     if not raw_text:
@@ -60,18 +95,6 @@ async def parse_concert_schedule(
         )
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir)
-            table_data = detect_tables(pil_image, output_path)
-
-        schedule = extract_schedule(raw_text, table_data)
-
-        for stage_name in list(schedule.stages.keys()):
-            cleaned = clean_stage_name(stage_name)
-            schedule.stages[cleaned] = schedule.stages.pop(stage_name)
-            for slot in schedule.stages[cleaned]:
-                slot.group = clean_group_name(slot.group)
-
         confidence = compute_confidence(schedule)
 
         return ParseResponse(

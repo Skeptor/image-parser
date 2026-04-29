@@ -9,8 +9,7 @@ class ConcertSlot(BaseModel):
 
 class StageSchedule(BaseModel):
     stages: dict[str, list[ConcertSlot]] = Field(default_factory=dict)
-    festival: str | None = None
-    date: str | None = None
+    date: str | None = None  # Format: DD/MM/YYYY
 
 
 class ParseResponse(BaseModel):
