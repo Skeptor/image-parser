@@ -581,13 +581,34 @@ def parse_from_text(text: str) -> StageSchedule:
 
 
 def merge_schedules(schedules: list[StageSchedule]) -> StageSchedule:
-    """Merge multiple StageSchedule objects into one."""
+    """Merge multiple StageSchedule objects into one, removing duplicate slots."""
     merged = StageSchedule()
     for s in schedules:
         if s.date and not merged.date:
             merged.date = s.date
         for stage_name, slots in s.stages.items():
             merged.stages.setdefault(stage_name, []).extend(slots)
+
+    # Deduplicate slots within each stage
+    # Two slots are duplicates if they have the same start_time and very similar artist names
+    for stage_name, slots in merged.stages.items():
+        if not slots:
+            continue
+
+        deduped_slots = []
+        seen_keys = set()
+
+        for slot in slots:
+            # Create a key from normalized artist name + start time
+            artist_normalized = slot.group.lower().strip()[:30]  # First 30 chars, case-insensitive
+            slot_key = (artist_normalized, slot.start_time)
+
+            if slot_key not in seen_keys:
+                seen_keys.add(slot_key)
+                deduped_slots.append(slot)
+
+        merged.stages[stage_name] = deduped_slots
+
     return merged
 
 

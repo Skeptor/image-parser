@@ -141,6 +141,10 @@ def get_word_boxes(
     all_words = []
     word_positions = set()  # Track (text, left, top) to avoid duplicates
 
+    # Position tolerance for deduplication (pixels)
+    # Same word within 5px tolerance is considered a duplicate
+    pos_tolerance = 5
+
     # Try with preprocessed image
     processed = preprocess_for_ocr(image)
     config = f"--psm {psm} --oem {oem}"
@@ -152,7 +156,8 @@ def get_word_boxes(
         text = data["text"][i].strip()
         if not text or data["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
             continue
-        pos_key = (text, data["left"][i], data["top"][i])
+        # Use tolerance-based position key to deduplicate similar positions
+        pos_key = (text, data["left"][i] // pos_tolerance, data["top"][i] // pos_tolerance)
         if pos_key not in word_positions:
             word_positions.add(pos_key)
             all_words.append({
@@ -174,7 +179,8 @@ def get_word_boxes(
         text = data2["text"][i].strip()
         if not text or data2["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
             continue
-        pos_key = (text, data2["left"][i], data2["top"][i])
+        # Use tolerance-based position key to deduplicate similar positions
+        pos_key = (text, data2["left"][i] // pos_tolerance, data2["top"][i] // pos_tolerance)
         if pos_key not in word_positions:
             word_positions.add(pos_key)
             all_words.append({
@@ -197,7 +203,8 @@ def get_word_boxes(
         text = data3["text"][i].strip()
         if not text or data3["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
             continue
-        pos_key = (text, data3["left"][i], data3["top"][i])
+        # Use tolerance-based position key to deduplicate similar positions
+        pos_key = (text, data3["left"][i] // pos_tolerance, data3["top"][i] // pos_tolerance)
         if pos_key not in word_positions:
             word_positions.add(pos_key)
             all_words.append({
@@ -561,15 +568,22 @@ def get_column_text_from_words(column: Column, skip_header_y: int = 0) -> str:
         return ""
 
     # Deduplicate words at approximately the same position
+    # Use a more robust approach: for each word, check if there's already
+    # a very similar word nearby
     deduped_words = []
-    word_positions = set()
-    position_tolerance = 10
+    position_tolerance = 15  # Increased from 10 to 15 pixels
 
     for w in words:
-        # Create a position key with tolerance
-        pos_key = (w["text"], w["top"] // position_tolerance, w["left"] // position_tolerance)
-        if pos_key not in word_positions:
-            word_positions.add(pos_key)
+        # Check if this word is a duplicate of an existing word
+        is_duplicate = False
+        for existing in deduped_words:
+            if (existing["text"] == w["text"] and
+                abs(existing["top"] - w["top"]) < position_tolerance and
+                abs(existing["left"] - w["left"]) < position_tolerance):
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
             deduped_words.append(w)
 
     words = deduped_words
@@ -595,7 +609,17 @@ def get_column_text_from_words(column: Column, skip_header_y: int = 0) -> str:
     text_lines = []
     for line in lines:
         line.sort(key=lambda x: x["left"])
-        line_text = " ".join(w["text"] for w in line)
+
+        # Remove consecutive duplicate words on the same line
+        # (Sometimes OCR detects the same word multiple times horizontally)
+        deduplicated_line = []
+        prev_text = None
+        for w in line:
+            if w["text"] != prev_text:
+                deduplicated_line.append(w)
+                prev_text = w["text"]
+
+        line_text = " ".join(w["text"] for w in deduplicated_line)
         # Filter out lines that are just noise (single characters, etc.)
         if len(line_text.strip()) > 1:
             text_lines.append(line_text)
