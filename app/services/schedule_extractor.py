@@ -12,6 +12,9 @@ TIME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Catches garbled OCR times where a digit was misread as a letter, e.g. "22:D00H"
+GARBLED_TIME_PATTERN = re.compile(r"\b\d{1,2}:[A-Za-z]\d+[A-Za-z]*\b")
+
 DATE_PATTERN = re.compile(
     r"\b(\d{1,2})[/\-\.](\d{1,2})(?:[/\-\.](\d{2,4}))?\b"
 )
@@ -320,10 +323,23 @@ def parse_from_table_rows(rows: list[list[str]]) -> StageSchedule:
     return schedule
 
 
+def _deduplicate_phrase(text: str) -> str:
+    """Remove exact phrase repetitions: 'Name Name' → 'Name', 'A B A B' → 'A B'."""
+    words = text.split()
+    n = len(words)
+    for length in range(1, n // 2 + 1):
+        if n % length == 0:
+            unit = words[:length]
+            if all(words[i : i + length] == unit for i in range(0, n, length)):
+                return " ".join(unit)
+    return text
+
+
 def _clean_group(text: str) -> str:
     """Extract the actual group name from a line, removing time ranges, separators, and noise."""
-    # Remove times
+    # Remove standard times and garbled OCR times (e.g. "22:D00H")
     cleaned = re.sub(TIME_PATTERN, " ", text).strip()
+    cleaned = re.sub(GARBLED_TIME_PATTERN, " ", cleaned).strip()
 
     # Remove common separators (but keep periods for abbreviations)
     cleaned = re.sub(r"[\|·•\>\→\[\]\(\)]+", " ", cleaned).strip()
@@ -366,6 +382,9 @@ def _clean_group(text: str) -> str:
 
     # Strip trailing separators (dashes, underscores, etc.)
     cleaned = cleaned.rstrip('_-=•·|>→ ')
+
+    # Remove repeated phrases introduced by multi-pass OCR (e.g. "Name Name" → "Name")
+    cleaned = _deduplicate_phrase(cleaned)
 
     return cleaned.strip()
 
@@ -436,9 +455,6 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
                             logger.info(f"Split cell into {len(time_pairs)} slots from {len(valid_times)} times")
 
                         for start_time, end_time in time_pairs:
-                            if not end_time:
-                                end_time = _infer_end_time(start_time)
-
                             slot = ConcertSlot(
                                 group=artist_name,
                                 start_time=start_time,
@@ -494,7 +510,7 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
                 if group_name and len(valid_times) > 0:
                     start_time = valid_times[0]
                     # Use second valid time if available, otherwise infer from start time
-                    end_time = valid_times[1] if len(valid_times) > 1 else _infer_end_time(start_time)
+                    end_time = valid_times[1] if len(valid_times) > 1 else None
 
                     slot = ConcertSlot(
                         group=group_name,

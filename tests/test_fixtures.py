@@ -147,13 +147,57 @@ async def test_vina_rock_parsing(client):
 
 
 @pytest.mark.anyio
+async def test_sonograma_parsing(client):
+    """Test Sonograma Ribero '25 (Viernes Noche) schedule parsing.
+
+    Block-based timeline layout with only start times — no explicit end times.
+    Validates that end_time is null for all slots and stages are detected correctly.
+    """
+    fixture_path = FIXTURES_DIR / "sonograma_viernes.png"
+    assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
+
+    with open(fixture_path, "rb") as f:
+        resp = await client.post(
+            "/parse",
+            params={"lang": "spa"},
+            files={"image": ("sonograma_viernes.png", f, "image/png")},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["success"] is True
+    assert data["data"] is not None
+    assert data["confidence"] > 0.4, f"Low confidence: {data['confidence']}"
+
+    stages = data["data"]["stages"]
+    assert len(stages) >= 5, f"Expected at least 5 stages, got {len(stages)}: {list(stages.keys())}"
+
+    total_slots = sum(len(slots) for slots in stages.values())
+    assert total_slots >= 20, f"Expected at least 20 total slots, got {total_slots}"
+
+    # All slots must have end_time null (no explicit end times in this image type)
+    for stage_name, slots in stages.items():
+        for slot in slots:
+            assert slot.get("end_time") is None, \
+                f"Expected null end_time in {stage_name} for '{slot.get('group')}', got {slot.get('end_time')}"
+            assert ":" in slot["start_time"], f"Invalid start_time: {slot['start_time']}"
+
+    # At least one known artist should be detected
+    all_artists = [slot["group"].upper() for slots in stages.values() for slot in slots]
+    known_artists = {"CHAMBAO", "FRANZ FERDINAND", "CARLOS JEAN", "BESMAYA", "NIKONE"}
+    found = known_artists & {a for a in all_artists for k in known_artists if k in a}
+    assert found, f"No known artists detected. Got: {all_artists[:10]}"
+
+
+@pytest.mark.anyio
 async def test_fixtures_stability(client):
     """Smoke test to ensure both fixtures parse without errors.
 
     This test ensures that code changes don't break parsing entirely.
     More detailed assertions are in the individual fixture tests.
     """
-    fixtures = ["sansan_festival.png", "vina_rock_sabado.png"]
+    fixtures = ["sansan_festival.png", "vina_rock_sabado.png", "sonograma_viernes.png"]
 
     for fixture_name in fixtures:
         fixture_path = FIXTURES_DIR / fixture_name
