@@ -40,6 +40,9 @@ STAGE_KEYWORDS = {
 }
 
 
+# Words that reliably signal schedule-management lines (opening/closing notices), not artist names.
+_SCHEDULE_BOILERPLATE = frozenset({"apertura", "cierre", "puertas", "horas"})
+
 KNOWN_STAGES = {
     "negrita": "Escenario Negrita",
     "cutty sark": "Escenario Cutty Sark",
@@ -413,11 +416,23 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
         cells = _detect_cells_in_column(column_words, min_cell_gap=35)  # 35px gap works for most festival schedules
         logger.info(f"Column {stage_hint}: detected {len(cells)} cells")
 
-        for i, cell in enumerate(cells):
-            # Sort words left-to-right, top-to-bottom within cell
+        # Pre-compute cell texts and which cells have valid times.
+        # Used to bound where timeless slots are safe to emit (between first and last timed cell).
+        cell_texts = []
+        for cell in cells:
             cell_sorted = sorted(cell, key=lambda w: (w.get("top", 0), w.get("left", 0)))
-            cell_text = " ".join(w.get("text", "") for w in cell_sorted)
+            cell_texts.append(" ".join(w.get("text", "") for w in cell_sorted))
 
+        timed_indices = [
+            i for i, ct in enumerate(cell_texts)
+            if any(_is_valid_time(t) for t in _extract_times(ct))
+        ]
+        first_timed = timed_indices[0] if timed_indices else -1
+        last_timed = timed_indices[-1] if timed_indices else -1
+
+        seen_real_slot = False  # True after first timed slot with a non-boilerplate artist
+
+        for i, (cell, cell_text) in enumerate(zip(cells, cell_texts)):
             logger.info(f"  Cell {i}: {len(cell)} words, text='{cell_text[:60]}'")
 
             # Skip stage header if found
@@ -436,6 +451,8 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
                 artist_name = _clean_group(cell_text)
 
                 if artist_name and len(artist_name) > 1:
+                    is_boilerplate = any(w in artist_name.lower() for w in _SCHEDULE_BOILERPLATE)
+
                     # Deduplicate times
                     unique_times = []
                     seen_times = set()
@@ -447,7 +464,7 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
                     # Validate times
                     valid_times = [t for t in unique_times if _is_valid_time(t)]
 
-                    if valid_times:
+                    if valid_times and not is_boilerplate:
                         # Split by time pairs if multiple times detected
                         time_pairs = _split_by_time_pairs(valid_times)
 
@@ -461,6 +478,25 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
                                 end_time=end_time
                             )
                             schedule.stages.setdefault(stage_name, []).append(slot)
+
+                        seen_real_slot = True
+
+            else:
+                # No times in this cell — emit a timeless slot when we are confident we are
+                # inside the schedule body (past the first real artist, before the end marker).
+                # This handles timetable-grid images where a shared time column ends up in a
+                # different detected column, leaving artists with no adjacent time text.
+                if seen_real_slot and first_timed <= i < last_timed:
+                    artist_name = _clean_group(cell_text)
+                    if (
+                        artist_name
+                        and len(artist_name) > 4
+                        and not any(w in artist_name.lower() for w in _SCHEDULE_BOILERPLATE)
+                    ):
+                        logger.info("    -> No time, adding timeless slot: %s", artist_name)
+                        schedule.stages.setdefault(stage_name, []).append(
+                            ConcertSlot(group=artist_name, start_time=None, end_time=None)
+                        )
 
         # Ensure stage exists even if empty
         if stage_name and stage_name not in schedule.stages:

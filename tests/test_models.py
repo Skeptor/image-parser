@@ -6,7 +6,6 @@ class TestParseResponse:
         resp = ParseResponse(
             success=True,
             data=StageSchedule(
-                festival="Test Fest",
                 stages={
                     "Main": [
                         ConcertSlot(group="Band A", start_time="18:00", end_time="18:45")
@@ -17,7 +16,7 @@ class TestParseResponse:
             raw_text="sample",
         )
         assert resp.success is True
-        assert resp.data.festival == "Test Fest"
+        assert resp.data.stages["Main"][0].group == "Band A"
         assert resp.confidence == 0.9
 
     def test_failure_response(self):

@@ -116,6 +116,7 @@ def get_word_boxes(
     lang: str = "eng",
     psm: int = 4,
     oem: int = 1,
+    boundary_only: bool = False,
 ) -> list[dict]:
     """Run Tesseract and return word-level bounding boxes.
 
@@ -138,84 +139,55 @@ def get_word_boxes(
         psm: Page segmentation mode (default: 4 for single column)
         oem: OCR engine mode (default: 2 for hybrid LSTM)
     """
-    all_words = []
-    word_positions = set()  # Track (text, left, top) to avoid duplicates
-
-    # Position tolerance for deduplication (pixels)
-    # Same word within 5px tolerance is considered a duplicate
-    pos_tolerance = 5
-
-    # Try with preprocessed image
-    processed = preprocess_for_ocr(image)
     config = f"--psm {psm} --oem {oem}"
-    data = pytesseract.image_to_data(
-        processed, lang=lang, config=config, output_type=pytesseract.Output.DICT
-    )
+    all_words = []
+    word_positions: set[tuple] = set()
+    pos_tolerance = 5  # px tolerance for deduplication
 
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text or data["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
-            continue
-        # Use tolerance-based position key to deduplicate similar positions
-        pos_key = (text, data["left"][i] // pos_tolerance, data["top"][i] // pos_tolerance)
-        if pos_key not in word_positions:
-            word_positions.add(pos_key)
-            all_words.append({
-                "text": text,
-                "left": data["left"][i],
-                "top": data["top"][i],
-                "width": data["width"][i],
-                "height": data["height"][i],
-                "confidence": data["conf"][i],
-                "x_center": data["left"][i] + data["width"][i] // 2,
-            })
+    def _collect(pil_img: Image.Image, min_conf: int = 30) -> None:
+        data = pytesseract.image_to_data(
+            pil_img, lang=lang, config=config, output_type=pytesseract.Output.DICT
+        )
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text or data["conf"][i] < min_conf:
+                continue
+            pos_key = (text, data["left"][i] // pos_tolerance, data["top"][i] // pos_tolerance)
+            if pos_key not in word_positions:
+                word_positions.add(pos_key)
+                all_words.append({
+                    "text": text,
+                    "left": data["left"][i],
+                    "top": data["top"][i],
+                    "width": data["width"][i],
+                    "height": data["height"][i],
+                    "confidence": data["conf"][i],
+                    "x_center": data["left"][i] + data["width"][i] // 2,
+                })
 
-    # Also try with original image (no preprocessing) to catch words lost in preprocessing
-    data2 = pytesseract.image_to_data(
-        image, lang=lang, config=config, output_type=pytesseract.Output.DICT
-    )
+    # Pass 1: standard grayscale + contrast + Otsu binarization
+    _collect(preprocess_for_ocr(image))
 
-    for i in range(len(data2["text"])):
-        text = data2["text"][i].strip()
-        if not text or data2["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
-            continue
-        # Use tolerance-based position key to deduplicate similar positions
-        pos_key = (text, data2["left"][i] // pos_tolerance, data2["top"][i] // pos_tolerance)
-        if pos_key not in word_positions:
-            word_positions.add(pos_key)
-            all_words.append({
-                "text": text,
-                "left": data2["left"][i],
-                "top": data2["top"][i],
-                "width": data2["width"][i],
-                "height": data2["height"][i],
-                "confidence": data2["conf"][i],
-                "x_center": data2["left"][i] + data2["width"][i] // 2,
-            })
+    # Pass 2: original image (no preprocessing) — recovers words lost by binarization
+    _collect(image)
 
-    # Try with inverted colors (helps with light text on dark backgrounds)
-    inverted = preprocess_for_ocr(image, invert=True)
-    data3 = pytesseract.image_to_data(
-        inverted, lang=lang, config=config, output_type=pytesseract.Output.DICT
-    )
+    # Pass 3: inverted — helps with light text on dark backgrounds
+    _collect(preprocess_for_ocr(image, invert=True))
 
-    for i in range(len(data3["text"])):
-        text = data3["text"][i].strip()
-        if not text or data3["conf"][i] < 30:  # Increased from 10 to 30 for better filtering
-            continue
-        # Use tolerance-based position key to deduplicate similar positions
-        pos_key = (text, data3["left"][i] // pos_tolerance, data3["top"][i] // pos_tolerance)
-        if pos_key not in word_positions:
-            word_positions.add(pos_key)
-            all_words.append({
-                "text": text,
-                "left": data3["left"][i],
-                "top": data3["top"][i],
-                "width": data3["width"][i],
-                "height": data3["height"][i],
-                "confidence": data3["conf"][i],
-                "x_center": data3["left"][i] + data3["width"][i] // 2,
-            })
+    if not boundary_only:
+        # Pass 4: green channel — better contrast on pink/yellow/red colored backgrounds.
+        # Global Otsu binarization often fails on large coloured areas; extracting a single
+        # channel bypasses this. Not used for column-boundary detection because the different
+        # x-positions it finds can introduce false gaps in the histogram.
+        rgb = image.convert("RGB")
+        g_channel = Image.fromarray(np.array(rgb)[:, :, 1])
+        _collect(g_channel)
+
+        # Pass 5: CLAHE on grayscale — local contrast enhancement for images where large
+        # bright areas cause global Otsu to lose text detail.
+        gray_arr = np.array(image.convert("L"))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        _collect(Image.fromarray(clahe.apply(gray_arr)))
 
     return all_words
 
@@ -438,10 +410,19 @@ def detect_columns(
     image = upscale_if_needed(image)
 
     w, h = image.size
-    words = get_word_boxes(image, lang=lang, psm=psm, oem=oem)
+
+    # Two-phase word collection:
+    # Phase 1 (boundary_only=True) — 3 standard passes used to determine column splits.
+    #   Using only these keeps the x-position histogram stable so column gaps are reliable.
+    # Phase 2 (boundary_only=False) — all 5 passes (+ G-channel, CLAHE) for richer text
+    #   extraction. Words are assigned to already-detected column boundaries.
+    boundary_words = get_word_boxes(image, lang=lang, psm=psm, oem=oem, boundary_only=True)
+    all_words = get_word_boxes(image, lang=lang, psm=psm, oem=oem, boundary_only=False)
+    # Use boundary_words for column detection, all_words for column content
+    words = boundary_words
 
     if not words:
-        return [Column(index=0, x_start=0, x_end=w, words=[], header=None)]
+        return [Column(index=0, x_start=0, x_end=w, words=all_words, header=None)]
 
     # Try to find headers first
     headers = _find_header_columns(words, h, w)
@@ -461,9 +442,9 @@ def detect_columns(
             else:
                 col_x_end = w
 
-            # Get words in this column (by x_center position)
+            # Use all_words (enriched with G-channel/CLAHE) for column content
             col_words = [
-                wd for wd in words
+                wd for wd in all_words
                 if col_x_start <= wd["x_center"] < col_x_end
             ]
 
@@ -478,9 +459,8 @@ def detect_columns(
         # Check for time column on the left (before first header)
         first_header_x = sorted_headers[0][0]
         if first_header_x > 50:  # There's space for a time column
-            time_words = [wd for wd in words if wd["x_center"] < first_header_x]
+            time_words = [wd for wd in all_words if wd["x_center"] < first_header_x]
             if time_words:
-                # Insert time column at the beginning (but don't include in parsing)
                 logger.info("Detected time axis column (x < %d)", first_header_x)
 
         for col in columns:
@@ -491,13 +471,12 @@ def detect_columns(
 
         return columns
 
-    # Fallback: use gap detection
+    # Fallback: use gap detection (boundaries from boundary_words, content from all_words)
     boundaries = _find_column_boundaries(words, w, min_gap=40)
 
     if len(boundaries) >= 1:
         logger.info("Using gap-based column detection, found %d boundaries", len(boundaries))
 
-        # Create columns from boundaries
         all_bounds = [0] + boundaries + [w]
         columns = []
 
@@ -506,7 +485,7 @@ def detect_columns(
             col_x_end = all_bounds[idx + 1]
 
             col_words = [
-                wd for wd in words
+                wd for wd in all_words
                 if col_x_start <= wd["x_center"] < col_x_end
             ]
 
@@ -521,7 +500,6 @@ def detect_columns(
         # Filter out columns with very few words (likely time axis)
         columns = [c for c in columns if len(c.words) > 3]
 
-        # Re-index
         for i, col in enumerate(columns):
             col.index = i
 
@@ -533,9 +511,89 @@ def detect_columns(
                 )
             return columns
 
-    # Ultimate fallback: single column
+    # Ultimate fallback: single column with enriched words
     logger.info("Treating image as single column")
-    return [Column(index=0, x_start=0, x_end=w, words=words, header=None)]
+    return [Column(index=0, x_start=0, x_end=w, words=all_words, header=None)]
+
+
+_SPANISH_DAY_NAMES = frozenset({
+    "lunes", "martes", "miercoles", "miércoles", "jueves",
+    "viernes", "sabado", "sábado", "domingo",
+})
+_ENGLISH_DAY_NAMES = frozenset({
+    "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+})
+_ALL_DAY_NAMES = _SPANISH_DAY_NAMES | _ENGLISH_DAY_NAMES
+
+
+@dataclass
+class DayRegion:
+    """A detected day section within a multi-day image."""
+    day_name: str
+    crop: tuple[int, int, int, int]  # (x1, y1, x2, y2)
+
+
+def detect_day_regions(image: Image.Image, lang: str = "spa") -> list[DayRegion] | None:
+    """Detect multiple days in one image (side-by-side or stacked).
+
+    Scans the top 30% for day-of-week words. Returns None for single-day images,
+    or a list of DayRegion objects describing each day's crop.
+    """
+    w, h = image.size
+    header_image = image.crop((0, 0, w, int(h * 0.30)))
+    words = get_word_boxes(header_image, lang=lang, psm=6, oem=1)
+
+    day_words = [
+        word for word in words
+        if word["text"].lower().strip(".,;:") in _ALL_DAY_NAMES
+    ]
+
+    if len(day_words) < 2:
+        return None
+
+    # Deduplicate: same word within 50px x-band counts once
+    seen: set[tuple[str, int]] = set()
+    unique: list[dict] = []
+    for dw in sorted(day_words, key=lambda d: d["x_center"]):
+        key = (dw["text"].lower().strip(".,;:"), dw["x_center"] // 50)
+        if key not in seen:
+            seen.add(key)
+            unique.append(dw)
+
+    if len(unique) < 2:
+        return None
+
+    x_spread = max(d["x_center"] for d in unique) - min(d["x_center"] for d in unique)
+    y_spread = max(d["top"] for d in unique) - min(d["top"] for d in unique)
+
+    if x_spread > w * 0.25:  # Side-by-side layout
+        unique.sort(key=lambda d: d["x_center"])
+        centers = [d["x_center"] for d in unique]
+        splits = [(centers[i] + centers[i + 1]) // 2 for i in range(len(centers) - 1)]
+        x_bounds = [0] + splits + [w]
+        return [
+            DayRegion(
+                day_name=unique[i]["text"].upper().strip(".,;:"),
+                crop=(x_bounds[i], 0, x_bounds[i + 1], h),
+            )
+            for i in range(len(unique))
+        ]
+
+    if y_spread > h * 0.10:  # Stacked layout
+        unique.sort(key=lambda d: d["top"])
+        tops = [d["top"] for d in unique]
+        splits = [(tops[i] + tops[i + 1]) // 2 for i in range(len(tops) - 1)]
+        y_bounds = [0] + splits + [h]
+        return [
+            DayRegion(
+                day_name=unique[i]["text"].upper().strip(".,;:"),
+                crop=(0, y_bounds[i], w, y_bounds[i + 1]),
+            )
+            for i in range(len(unique))
+        ]
+
+    return None  # Days too close together, treat as single day
 
 
 def crop_column(image: Image.Image, column: Column) -> Image.Image:
