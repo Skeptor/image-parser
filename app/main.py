@@ -1,9 +1,15 @@
 import logging
+import re
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Form, HTTPException, Query, Request, UploadFile
 from PIL import Image
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+_LANG_RE = re.compile(r"^[a-z]{2,4}(\+[a-z]{2,4})*$")
+limiter = Limiter(key_func=get_remote_address)
 
 from app.models import DaySchedule, ParseResponse, StageSchedule
 from app.services.column_detector import (
@@ -77,7 +83,9 @@ def _parse_image_section(pil_image: Image.Image, lang: str, psm: int) -> tuple[S
 
 
 @router.post("/parse", response_model=ParseResponse)
+@limiter.limit("20/minute")
 async def parse_concert_schedule(
+    request: Request,
     image: UploadFile | None = None,
     url: str | None = Form(None),
     lang: str = Query("eng", description="Tesseract language code"),
@@ -89,6 +97,11 @@ async def parse_concert_schedule(
             detail="Either 'image' (file upload) or 'url' must be provided",
         )
 
+    if not _LANG_RE.match(lang):
+        raise HTTPException(status_code=400, detail="Invalid lang parameter")
+    if not 0 <= psm <= 13:
+        raise HTTPException(status_code=400, detail="psm must be between 0 and 13")
+
     try:
         pil_image = (
             load_from_upload(image.file, image.filename)
@@ -96,9 +109,11 @@ async def parse_concert_schedule(
             else await load_from_url(url)
         )
     except ImageLoadError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load image: {e}")
+        logger.warning("Image load error: %s", e)
+        raise HTTPException(status_code=400, detail="Failed to load image")
+    except Exception:
+        logger.exception("Unexpected error loading image")
+        raise HTTPException(status_code=400, detail="Failed to load image")
 
     try:
         day_regions = detect_day_regions(pil_image)
@@ -133,10 +148,11 @@ async def parse_concert_schedule(
             schedule, raw_text = _parse_image_section(pil_image, lang, psm)
 
     except OCRError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
+        logger.warning("OCR error: %s", e)
+        raise HTTPException(status_code=500, detail="OCR processing failed")
+    except Exception:
         logger.exception("Parse pipeline failed")
-        raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
+        raise HTTPException(status_code=500, detail="OCR processing failed")
 
     if not raw_text:
         return ParseResponse(
@@ -153,11 +169,11 @@ async def parse_concert_schedule(
             confidence=confidence,
             raw_text=raw_text,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Schedule extraction failed")
         return ParseResponse(
             success=False,
-            error=f"Failed to parse schedule: {e}",
+            error="Failed to parse schedule",
             confidence=0.0,
             raw_text=raw_text,
         )

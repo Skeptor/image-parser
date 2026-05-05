@@ -3,7 +3,8 @@ uvicorn[standard]==0.32.0
 pydantic==2.9.0
 python-multipart==0.0.12
 pytesseract==0.3.13
-Pillow==10.4.0
+Pillow==11.2.1
+slowapi==0.1.9
 camelot-py[base]==0.11.0
 opencv-python-headless==4.10.0.84
 reportlab==4.2.2
