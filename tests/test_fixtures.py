@@ -252,13 +252,103 @@ async def test_toledo_beat_parsing(client):
 
 
 @pytest.mark.anyio
+async def test_venres_parsing(client):
+    """Test O Son do Camiño festival — VENRES (Friday) schedule.
+
+    Two-column layout with clear fonts on white/light background.
+    - Column 1: Escenario Xacobeo / Estrella Galicia — 8 artist slots, 16:45 – 02:20
+    - Column 2: Escenario Sonelectro TN — 5 DJ slots, 21:00 – 04:00
+
+    Key validation: the tight-row table layout used to collapse all rows into
+    one cell. This test guards against regressions in the line-based cell
+    detection fallback (_parse_slots_from_lines).
+    """
+    fixture_path = FIXTURES_DIR / "venres.png"
+    assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
+
+    with open(fixture_path, "rb") as f:
+        resp = await client.post(
+            "/parse",
+            params={"lang": "spa"},
+            files={"image": ("venres.png", f, "image/png")},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["data"] is not None
+    assert data["confidence"] > 0.6, f"Low confidence: {data['confidence']}"
+
+    stages = data["data"]["stages"]
+    assert len(stages) == 2, f"Expected 2 stages, got {len(stages)}: {list(stages.keys())}"
+
+    # Both columns must be present
+    stage_names_lower = " ".join(stages.keys()).lower()
+    assert "xacobeo" in stage_names_lower or "estrella" in stage_names_lower, \
+        f"Xacobeo/Estrella stage not found in {list(stages.keys())}"
+    assert "sonelectro" in stage_names_lower or "electro" in stage_names_lower, \
+        f"Sonelectro stage not found in {list(stages.keys())}"
+
+    # Column 1 must have all 8 artist slots (not collapsed into fewer)
+    xacobeo_stage = next(
+        slots for name, slots in stages.items()
+        if "xacobeo" in name.lower() or "estrella" in name.lower()
+    )
+    assert len(xacobeo_stage) >= 7, \
+        f"Expected ≥7 slots in Xacobeo stage, got {len(xacobeo_stage)}"
+
+    # Column 2 must have 5 DJ slots
+    sonelectro_stage = next(
+        slots for name, slots in stages.items()
+        if "sonelectro" in name.lower() or "electro" in name.lower()
+    )
+    assert len(sonelectro_stage) >= 4, \
+        f"Expected ≥4 slots in Sonelectro stage, got {len(sonelectro_stage)}"
+
+    # All slots must have valid start and end times
+    timed = 0
+    for stage_name, slots in stages.items():
+        for slot in slots:
+            assert "group" in slot, f"Slot missing 'group' in {stage_name}"
+            assert slot["group"], f"Empty group name in {stage_name}"
+            for field in ("start_time", "end_time"):
+                t = slot.get(field)
+                assert t is not None, f"Slot in {stage_name} missing {field}: {slot}"
+                assert ":" in t, f"Invalid time format in {stage_name}: {t}"
+                h, m = t.split(":")
+                assert h.isdigit() and m.isdigit(), f"Non-digit time in {stage_name}: {t}"
+                assert 0 <= int(h) <= 30 and 0 <= int(m) <= 59, \
+                    f"Out-of-range time in {stage_name}: {t}"
+            timed += 1
+
+    assert timed >= 11, f"Expected ≥11 timed slots total, got {timed}"
+
+    # Known artists must appear somewhere in the group names
+    all_groups = " ".join(
+        slot["group"].upper()
+        for slots in stages.values()
+        for slot in slots
+    )
+    known = {
+        "HOOBASTANK": "HOOBASTANK",
+        "BIFFY CLYRO": "BIFFY CLYRO",
+        "BLOODY BEETROOTS": "BLOODY",
+        "HONEYLUV": "HONEYLUV",
+        "CARLITA": "CARLITA",
+    }
+    for label, fragment in known.items():
+        assert fragment in all_groups, \
+            f"Expected artist '{label}' (fragment '{fragment}') not found in output: {all_groups[:200]}"
+
+
+@pytest.mark.anyio
 async def test_fixtures_stability(client):
     """Smoke test to ensure both fixtures parse without errors.
 
     This test ensures that code changes don't break parsing entirely.
     More detailed assertions are in the individual fixture tests.
     """
-    fixtures = ["sansan_festival.png", "vina_rock_sabado.png", "sonograma_viernes.png"]
+    fixtures = ["sansan_festival.png", "vina_rock_sabado.png", "sonograma_viernes.png", "venres.png"]
 
     for fixture_name in fixtures:
         fixture_path = FIXTURES_DIR / fixture_name

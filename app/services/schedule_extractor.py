@@ -226,6 +226,75 @@ def _split_by_time_pairs(times: list[str]) -> list[tuple[str, str | None]]:
     return pairs
 
 
+def _words_to_lines(words: list[dict], line_tolerance: int = 8) -> list[list[dict]]:
+    """Group words into text lines by vertical midpoint proximity."""
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: w.get("top", 0))
+    lines: list[list[dict]] = []
+    current_line = [sorted_words[0]]
+    for word in sorted_words[1:]:
+        line_mid = sum(w.get("top", 0) + w.get("height", 0) // 2 for w in current_line) / len(current_line)
+        word_mid = word.get("top", 0) + word.get("height", 0) // 2
+        if abs(word_mid - line_mid) <= line_tolerance:
+            current_line.append(word)
+        else:
+            lines.append(sorted(current_line, key=lambda w: w.get("left", 0)))
+            current_line = [word]
+    if current_line:
+        lines.append(sorted(current_line, key=lambda w: w.get("left", 0)))
+    return lines
+
+
+def _has_real_text(s: str) -> bool:
+    """Return True if string contains at least one word of 3+ alphabetic characters."""
+    return any(len(w) >= 3 and w.isalpha() for w in s.split())
+
+
+def _parse_slots_from_lines(lines: list[list[dict]], stage_name: str) -> StageSchedule:
+    """Parse schedule slots from word-position lines (line-per-row layout).
+
+    Handles images where artist names and times appear on the same row,
+    or where the artist name is on the line immediately above the time range.
+    """
+    schedule = StageSchedule()
+    pending_names: list[str] = []
+
+    for line in lines:
+        line_text = " ".join(w.get("text", "") for w in line)
+        times = [t for t in _extract_times(line_text) if _is_valid_time(t)]
+        cleaned_text = _clean_group(line_text)
+        is_boilerplate = any(w in cleaned_text.lower() for w in _SCHEDULE_BOILERPLATE)
+
+        if times and is_boilerplate:
+            pending_names = []
+            continue
+
+        if times:
+            # Prefer the current line's artist name only if it contains genuine text
+            # (not just numbers/symbols left over after time extraction).
+            if cleaned_text and len(cleaned_text) > 3 and _has_real_text(cleaned_text):
+                artist = cleaned_text
+                pending_names = []
+            elif pending_names:
+                artist = _clean_group(" ".join(pending_names))
+                pending_names = []
+            else:
+                artist = cleaned_text
+
+            if artist and len(artist) > 1:
+                unique_times = list(dict.fromkeys(times))
+                pairs = _split_by_time_pairs(unique_times)
+                for start, end in pairs:
+                    schedule.stages.setdefault(stage_name, []).append(
+                        ConcertSlot(group=artist, start_time=start, end_time=end)
+                    )
+        elif cleaned_text and len(cleaned_text) > 3 and not is_boilerplate:
+            pending_names.append(cleaned_text)
+
+    return schedule
+
+
 def _detect_cells_in_column(words: list[dict], min_cell_gap: int = 50) -> list[list[dict]]:
     """Detect cells (artist slots) by clustering words with vertical gaps.
 
@@ -416,6 +485,24 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
         cells = _detect_cells_in_column(column_words, min_cell_gap=35)  # 35px gap works for most festival schedules
         logger.info(f"Column {stage_hint}: detected {len(cells)} cells")
 
+        # Sanity check: if any cell contains many valid times, it means rows are too tightly
+        # packed for gap-based cell detection. Fall back to line-by-line parsing.
+        max_times_in_cell = 0
+        for _cell in cells:
+            _ct = " ".join(w.get("text", "") for w in _cell)
+            _n = len([t for t in _extract_times(_ct) if _is_valid_time(t)])
+            if _n > max_times_in_cell:
+                max_times_in_cell = _n
+        if max_times_in_cell > 4:
+            logger.info(
+                "Cell detection collapsed rows (max %d times/cell) — using line-based word parsing",
+                max_times_in_cell,
+            )
+            lines = _words_to_lines(column_words, line_tolerance=8)
+            result = _parse_slots_from_lines(lines, stage_name)
+            if result.stages:
+                return result
+
         # Pre-compute cell texts and which cells have valid times.
         # Used to bound where timeless slots are safe to emit (between first and last timed cell).
         cell_texts = []
@@ -528,8 +615,13 @@ def parse_column_text(text: str, stage_hint: str | None = None, column_words: li
             if name_on_this_line:
                 accumulated_name.append(name_on_this_line)
 
-            if accumulated_name:
-                group_name = " ".join(accumulated_name).strip()
+            group_name = " ".join(accumulated_name).strip()
+            is_boilerplate = any(w in group_name.lower() for w in _SCHEDULE_BOILERPLATE)
+
+            if is_boilerplate:
+                # Opening/closing notice — discard accumulated name without creating a slot
+                accumulated_name = []
+            elif accumulated_name:
 
                 # Deduplicate times (OCR often creates duplicates like "20:30 20:30")
                 unique_times = []
